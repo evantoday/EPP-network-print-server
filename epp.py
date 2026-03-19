@@ -30,6 +30,15 @@ MAX_DATA_SIZE = 10 * 1024 * 1024  # 10 MB max data size
 # Thread lock for shared state
 _lock = threading.Lock()
 
+MAX_ERRORS = 20  # Keep last N errors in memory
+
+def record_error(message):
+    """Record an error to the in-memory error list for /health visibility."""
+    entry = {"timestamp": str(datetime.now()), "message": str(message)}
+    with _lock:
+        status["errors"].append(entry)
+        status["errors"] = status["errors"][-MAX_ERRORS:]
+
 
 def get_resource_path(relative_path):
     """Dapatkan path file dalam aplikasi PyInstaller."""
@@ -59,7 +68,7 @@ def file_is_same(src, dst):
 
 # Flask Web Dashboard
 app = Flask(__name__)
-status = {"last_request": None, "total_jobs": 0}
+status = {"last_request": None, "total_jobs": 0, "errors": []}
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -139,6 +148,7 @@ def send_to_printer(data, job_id=None):
             # Cek max reprint
             if current_count >= MAX_REPRINT:
                 logging.warning("❌ Max reprint reached")
+                record_error(f"Max reprint reached for job {job_id}")
                 return {"status": False, "message": "Max reprint reached"}
 
             # Tambah counter
@@ -192,6 +202,7 @@ def send_to_printer(data, job_id=None):
         return {"status": True}
     except Exception as e:
         logging.error(f"❌ Kesalahan printer: {e}")
+        record_error(f"Printer error: {e}")
         return {"status": False, "message": str(e)}
 
 def check_port_in_use(port):
@@ -206,6 +217,7 @@ def start_server():
 
     if check_port_in_use(port):
         logging.error(f"❌ Port {port} sudah digunakan! Aplikasi dihentikan.")
+        record_error(f"Port {port} already in use")
         os._exit(1)
 
     try:
@@ -232,6 +244,7 @@ def start_server():
                                     data += chunk
                                     if len(data) > MAX_DATA_SIZE:
                                         logging.warning(f"⚠️ Data dari {addr} melebihi batas {MAX_DATA_SIZE} bytes, memotong koneksi")
+                                        record_error(f"Data from {addr} exceeded {MAX_DATA_SIZE} bytes")
                                         break
                                 except socket.timeout:
                                     break  # Timeout, asumsi data selesai
@@ -248,14 +261,18 @@ def start_server():
 
                         except ConnectionResetError as e:
                             logging.warning(f"⚠️ Koneksi dengan {addr} terputus secara paksa: {e}")
+                            record_error(f"Connection reset from {addr}: {e}")
                         except Exception as e:
                             logging.error(f"❌ Error tidak terduga saat menerima data dari {addr}: {e}")
+                            record_error(f"Unexpected error from {addr}: {e}")
 
                 except OSError as e:
                     logging.error(f"❌ Error saat menerima koneksi: {e}")
+                    record_error(f"Connection accept error: {e}")
 
     except OSError as e:
         logging.error(f"❌ Gagal menjalankan server: {e}")
+        record_error(f"Server start failed: {e}")
         os._exit(1)
 
 
@@ -357,12 +374,15 @@ def health():
     with _lock:
         current_status = dict(status)
     config = load_config()
+    errors = current_status.get("errors", [])
     return jsonify({
-        "status": "ok",
+        "status": "ok" if not errors else "degraded",
         "total_jobs": current_status["total_jobs"],
         "last_request": current_status["last_request"],
         "printer": config.get("PRINTER_NAME", ""),
-        "port": config.get("PORT", DEFAULT_PORT)
+        "port": config.get("PORT", DEFAULT_PORT),
+        "error_count": len(errors),
+        "recent_errors": errors[-5:]
     })
 
 @app.route("/history/delete/<int:job_id>", methods=["POST"])
